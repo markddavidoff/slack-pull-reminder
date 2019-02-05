@@ -57,7 +57,7 @@ state_to_emoji = {
     CombinedBuildStatus.success: SUCCESS_EMOJI,
     CombinedBuildStatus.pending: PENDING_EMOJI,
     CombinedBuildStatus.failure: FAILURE_EMOJI,
-    None: ' '  # for when there is no status for one PR but you still want the rest of the text to line up
+    None: '       '  # for when there is no status for one PR but you still want the rest of the text to line up
 }
 
 SPLIT_BY_REVIEW_STATUS = os.environ.get('SPLIT_BY_REVIEW_STATUS', True)
@@ -254,7 +254,7 @@ def fetch_pull_request_review_status_group(pull_request):
     return PullRequestStatusGroup.unreviewed
 
 
-def format_pull_requests(pull_requests, owner, repository):
+def format_pull_requests(pull_requests, owner):
 
     grouped_by_pr_status = defaultdict(list)
 
@@ -266,12 +266,12 @@ def format_pull_requests(pull_requests, owner, repository):
                 pr_status_group = fetch_pull_request_review_status_group(pull)
             else:
                 pr_status_group = 'default'
-            if SHOW_BUILD_STATUS and combined_status:
-                build_status = state_to_emoji.get(combined_status, PENDING_EMOJI)
+            if SHOW_BUILD_STATUS:
+                build_status = state_to_emoji.get(combined_status, state_to_emoji[None])
             else:
                 build_status = ""
             line = '*{}[{}/{}]* <{}|{} - by {}>'.format(
-                build_status, owner, repository, pull.html_url, pull.title, creator)
+                build_status, owner, pull.repository.name, pull.html_url, pull.title, creator)
             grouped_by_pr_status[pr_status_group].append(line)
 
     if not SPLIT_BY_REVIEW_STATUS:
@@ -295,12 +295,14 @@ def fetch_organization_pulls(organization_name):
     organization = client.organization(organization_name)
     lines = []
 
+    prs = []
     for repository in organization.repositories():
         if REPOSITORIES and repository.name.lower() not in REPOSITORIES:
             continue
         unchecked_pulls = fetch_repository_pulls(repository)
-        lines += format_pull_requests(unchecked_pulls, organization_name,
-                                      repository.name)
+        prs.extend(unchecked_pulls)
+
+    lines = format_pull_requests(prs, organization_name)
 
     return lines
 
