@@ -1,12 +1,35 @@
 import os
 import sys
-from collections import namedtuple
+from collections import namedtuple, defaultdict
+from enum import Enum, auto
 
 import requests
 from github3 import login
+from github3.pulls import ShortPullRequest
 from github3.repos import status
+from github3.repos.commit import ShortCommit
 
-CombinedBuildStatus = namedtuple('CombinedBuildStatus', ('success', 'pending', 'failure'))
+
+class CombinedBuildStatus:
+    success = 'success'
+    pending = 'pending'
+    failure = 'failure'
+
+
+class PullRequestStatusGroup(Enum):
+    approved = auto()
+    changes_requested = auto()
+    mixed_reception = auto()
+    unreviewed = auto()
+    changes_since_review = auto()
+
+
+class PullRequestReviewState:
+    APPROVED = 'APPROVED'
+    CHANGES_REQUESTED = 'CHANGES_REQUESTED'
+    COMMENTED = 'COMMENTED'
+    PENDING = 'PENDING'
+
 
 POST_URL = 'https://slack.com/api/chat.postMessage'
 
@@ -21,6 +44,10 @@ USERNAMES = [u.lower().strip() for u in usernames.split(',')] if usernames else 
 
 SLACK_CHANNEL = os.environ.get('SLACK_CHANNEL', '#general')
 
+ignore_build_status_contexts = os.environ.get('IGNORE_BUILD_STATUS_CONTEXTS')
+IGNORE_BUILD_STATUS_CONTEXTS = [
+    b.lower().strip() for b in ignore_build_status_contexts.split(',')] if ignore_build_status_contexts else []
+
 SHOW_BUILD_STATUS = os.environ.get('SHOW_BUILD_STATUS', True)
 SUCCESS_EMOJI = os.environ.get('SUCCESS_EMOJI', u'✓')
 PENDING_EMOJI = os.environ.get('PENDING_EMOJI', u'⟳')
@@ -32,6 +59,32 @@ state_to_emoji = {
     CombinedBuildStatus.failure: FAILURE_EMOJI,
     None: ' '  # for when there is no status for one PR but you still want the rest of the text to line up
 }
+
+SPLIT_BY_REVIEW_STATUS = os.environ.get('SPLIT_BY_REVIEW_STATUS', True)
+APPROVED_GROUP_MSG = os.environ.get('APPROVED_GROUP_MSG', u':heart_eyes: _Approved_')
+CHANGES_REQUESTED_GROUP_MSG = os.environ.get('CHANGES_REQUESTED_GROUP_MSG', u':thinking_face: _Changes Requested_')
+MIXED_RECEPTION_GROUP_MSG = os.environ.get('MIXED_RECEPTION_GROUP_MSG', u':confounded: _Mixed Reception_')
+UNREVIEWED_GROUP_MSG = os.environ.get('UNREVIEWED_GROUP_MSG', u':eyetwitch: _Needs Review_')
+CHANGES_SINCE_REVIEW_GROUP_MSG = os.environ.get(
+    'CHANGES_SINCE_REVIEW_GROUP_MSG', u':eyes: _Changes Since Last Review_')
+
+pr_status_group_to_msg = {
+    PullRequestStatusGroup.unreviewed: UNREVIEWED_GROUP_MSG,
+    PullRequestStatusGroup.mixed_reception: MIXED_RECEPTION_GROUP_MSG,
+    PullRequestStatusGroup.changes_requested: CHANGES_REQUESTED_GROUP_MSG,
+    PullRequestStatusGroup.approved: APPROVED_GROUP_MSG,
+    PullRequestStatusGroup.changes_since_review: CHANGES_SINCE_REVIEW_GROUP_MSG
+}
+pr_status_groups_display_order = [
+    PullRequestStatusGroup.unreviewed,
+    PullRequestStatusGroup.changes_since_review,
+    PullRequestStatusGroup.mixed_reception,
+    PullRequestStatusGroup.changes_requested,
+    PullRequestStatusGroup.approved
+]
+
+# safety check
+assert(set(pr_status_groups_display_order) == set(pr_status_group_to_msg.keys()))
 
 try:
     SLACK_API_TOKEN = os.environ['SLACK_API_TOKEN']
@@ -87,6 +140,10 @@ def fetch_combined_build_status(pull_request):
         elif build_status.updated_at > most_recent_status_by_context[build_status.context].updated_at:
             most_recent_status_by_context[build_status.context] = build_status
 
+    for context_to_ingnore in IGNORE_BUILD_STATUS_CONTEXTS:
+        if context_to_ingnore in most_recent_status_by_context:
+            del most_recent_status_by_context[context_to_ingnore]
+
     most_recent_statuses = most_recent_status_by_context.values()
 
     if len(most_recent_statuses) == 0:
@@ -124,22 +181,110 @@ def fetch_pull_request_build_statuses(pull_request):
     return pull_request._iter(-1, url, status.Status)
 
 
+class BetterShortRepoCommit(ShortCommit):
+    """Representation of an incomplete commit in a collection."""
+
+    class_name = 'Better Short Repository Commit'
+
+    def _update_attributes(self, commit):
+        super(BetterShortRepoCommit, self)._update_attributes(commit)
+        commit_data = commit['commit']
+        self.commit_date = self._strptime(commit_data['committer']['date'])
+
+
+# patch this onto PullRequest.
+def fetch_better_commits(pull_request, number=-1, etag=None):
+    """Iterate over the commits on this pull request.
+
+    :param int number:
+        (optional), number of commits to return. Default: -1 returns all
+        available commits.
+    :param str etag:
+        (optional), ETag from a previous request to the same endpoint
+    :returns:
+        generator of repository commit objects
+    :rtype:
+        :class:`~github3.repos.commit.ShortCommit`
+    """
+    url = pull_request._build_url('commits', base_url=pull_request._api)
+    return pull_request._iter(int(number), url, BetterShortRepoCommit, etag=etag)
+
+
+def fetch_pull_request_review_status_group(pull_request):
+    reviews = pull_request.reviews()
+
+    # sort by submit time, newest first
+    reviews = sorted(reviews, key=lambda r: r.submitted_at, reverse=True)
+    # remove author's review if there is one...
+    reviews = filter(lambda r: r.user != pull_request.user, reviews)
+    # remove comment reviews
+    reviews = filter(lambda r: r.state != PullRequestReviewState.COMMENTED, reviews)
+    # only keep last review by this reviewer
+    users = set()
+    last_reviews = []
+    for review in reviews:
+        if review.user in users:
+            # if have a more recent review from this use, skip this one
+            continue
+        else:
+            last_reviews.append(review)
+            users.add(review.user)
+
+    changes_requested = False
+    approved = False
+    for review in last_reviews:
+        if review.state == PullRequestReviewState.CHANGES_REQUESTED:
+            changes_requested = True
+        elif review.state == PullRequestReviewState.APPROVED:
+            approved = True
+
+    if changes_requested:
+        # sorted by date
+        commits = sorted(fetch_better_commits(pull_request), key=lambda r: r.commit_date, reverse=True)
+
+        if commits[0].commit_date > last_reviews[0].submitted_at:
+            return PullRequestStatusGroup.changes_since_review
+        if approved:
+            return PullRequestStatusGroup.mixed_reception
+        else:
+            return PullRequestStatusGroup.changes_requested
+    if approved:
+        return PullRequestStatusGroup.approved
+
+    return PullRequestStatusGroup.unreviewed
+
+
 def format_pull_requests(pull_requests, owner, repository):
-    lines = []
+
+    grouped_by_pr_status = defaultdict(list)
 
     for pull in pull_requests:
         if is_valid_title(pull.title):
             creator = pull.user.login
             combined_status = fetch_combined_build_status(pull)
+            if SPLIT_BY_REVIEW_STATUS:
+                pr_status_group = fetch_pull_request_review_status_group(pull)
+            else:
+                pr_status_group = 'default'
             if SHOW_BUILD_STATUS and combined_status:
-                build_status = state_to_emoji.get(combined_status)
+                build_status = state_to_emoji.get(combined_status, PENDING_EMOJI)
             else:
                 build_status = ""
             line = '*{}[{}/{}]* <{}|{} - by {}>'.format(
                 build_status, owner, repository, pull.html_url, pull.title, creator)
-            lines.append(line)
+            grouped_by_pr_status[pr_status_group].append(line)
 
-    return lines
+    if not SPLIT_BY_REVIEW_STATUS:
+        return grouped_by_pr_status['default']
+
+    output = []
+    for group in pr_status_groups_display_order:
+        lines = grouped_by_pr_status.get(group)
+        if lines:
+            output.append(pr_status_group_to_msg[group])
+            output.extend(lines)
+
+    return output
 
 
 def fetch_organization_pulls(organization_name):
