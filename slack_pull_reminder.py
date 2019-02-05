@@ -281,6 +281,7 @@ def format_pull_requests(pull_requests, owner):
     for group in pr_status_groups_display_order:
         lines = grouped_by_pr_status.get(group)
         if lines:
+            output.append("")  # blank spacer line
             output.append(pr_status_group_to_msg[group])
             output.extend(lines)
 
