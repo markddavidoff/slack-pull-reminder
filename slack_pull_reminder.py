@@ -215,6 +215,8 @@ def fetch_pull_request_review_status_group(pull_request):
 
     # sort by submit time, newest first
     reviews = sorted(reviews, key=lambda r: r.submitted_at, reverse=True)
+    print(pull_request.title)
+    print([(r.user, r.submitted_at) for r in reviews])
     # remove author's review if there is one...
     reviews = filter(lambda r: r.user != pull_request.user, reviews)
     # remove comment reviews
