@@ -36,7 +36,7 @@ POST_URL = 'https://slack.com/api/chat.postMessage'
 ignore = os.environ.get('IGNORE_WORDS')
 IGNORE_WORDS = [i.lower().strip() for i in ignore.split(',')] if ignore else []
 
-required = os.environ.get('REQUIRED_WORDS')
+required = os.environ.get('MUST_CONTAIN_ONE_OF')
 REQUIRED_WORDS = [i.lower().strip() for i in required.split(',')] if required else []
 
 repositories = os.environ.get('REPOSITORIES')
@@ -118,9 +118,11 @@ def is_valid_title(title):
         if ignored_word in lowercase_title:
             return False
     for required_word in REQUIRED_WORDS:
-        if required_word not in lowercase_title:
-            return False
-
+        if required_word in lowercase_title:
+            return True
+    if REQUIRED_WORDS:
+         # if there are required words set and we didn't find any of them
+        return False
     return True
 
 
